@@ -146,9 +146,16 @@ function Stop-Cos {
   Start-Sleep -Seconds 2
 }
 
+function Test-Elevated {
+  ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 function Start-CosAndGetPort($cos, [int]$timeoutSec = 60) {
   $mark = if (Test-Path $CosLog) { (Get-Item $CosLog).Length } else { 0 }
-  Start-Process -FilePath $cos.Exe | Out-Null
+  # The desktop-control app must never run elevated. If this installer was started
+  # "as administrator", hand the launch to Explorer, which starts it with the normal user token.
+  if (Test-Elevated) { Start-Process -FilePath "$env:WINDIR\explorer.exe" -ArgumentList "`"$($cos.Exe)`"" | Out-Null }
+  else { Start-Process -FilePath $cos.Exe | Out-Null }
   $deadline = (Get-Date).AddSeconds($timeoutSec)
   while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 1
@@ -167,8 +174,14 @@ function Start-CosAndGetPort($cos, [int]$timeoutSec = 60) {
 
 function Configure-Cos($cos, [string]$name) {
   if (-not (Test-Path $CosConfig)) {
+    # A fresh install does not start its server until it is configured; only wait for its settings file.
     Log "First start of Chat On Steroids to create its settings"
-    Start-CosAndGetPort $cos | Out-Null
+    if (Test-Elevated) { Start-Process -FilePath "$env:WINDIR\explorer.exe" -ArgumentList "`"$($cos.Exe)`"" | Out-Null }
+    else { Start-Process -FilePath $cos.Exe | Out-Null }
+    $deadline = (Get-Date).AddSeconds(120)
+    while (-not (Test-Path $CosConfig) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
+    if (-not (Test-Path $CosConfig)) { Fail "Chat On Steroids did not create its settings within 120 s" }
+    Start-Sleep -Seconds 3
   }
   Stop-Cos
   Copy-Item $CosConfig "$CosConfig.max-connection-backup" -Force
@@ -226,12 +239,16 @@ try {
   `$svc = Get-Service Cloudflared -ErrorAction SilentlyContinue
   `$marker = 'C:\ProgramData\MaxConnection\owner.txt'
   if (`$svc -and -not (Test-Path `$marker)) { throw 'A Cloudflared service not installed by Max Connection already exists; leaving it untouched.' }
-  if (`$svc) { & `$exe service uninstall 2>&1 | Out-Null; Start-Sleep 2 }
-  `$t = Get-Content '$tokFile' -Raw
-  & `$exe service install `$t 2>&1 | Out-Null
-  Remove-Item '$tokFile' -Force
+  # Claim ownership before installing, so an interrupted run can be repaired by re-running.
   New-Item -ItemType Directory -Force -Path 'C:\ProgramData\MaxConnection' | Out-Null
   Set-Content `$marker 'Max Connection'
+  # cloudflared logs progress on stderr; judge by exit code, not by the error stream.
+  if (`$svc) { `$u = Start-Process `$exe -ArgumentList 'service','uninstall' -Wait -PassThru -WindowStyle Hidden; Start-Sleep 3 }
+  `$t = (Get-Content '$tokFile' -Raw).Trim()
+  `$p = Start-Process `$exe -ArgumentList 'service','install',`$t -Wait -PassThru -WindowStyle Hidden
+  `$t = `$null
+  Remove-Item '$tokFile' -Force
+  if (`$p.ExitCode -ne 0) { throw "cloudflared service install exited `$(`$p.ExitCode)" }
   sc.exe failure Cloudflared reset= 86400 actions= restart/5000/restart/5000/restart/30000 | Out-Null
   Start-Service Cloudflared -ErrorAction SilentlyContinue
   'OK ' + (Get-Service Cloudflared).Status | Set-Content '$result'
@@ -239,9 +256,14 @@ try {
 "@
   $script = Join-Path $Home_ "elevated-step.ps1"
   Set-Content -Path $script -Value $elevated -Encoding UTF8
-  Log "Asking Windows for administrator rights to install the tunnel service"
   try {
-    Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$script`""
+    if (Test-Elevated) {
+      Log "Installing the tunnel service (installer already has administrator rights)"
+      Start-Process powershell.exe -WindowStyle Hidden -Wait -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$script`""
+    } else {
+      Log "Asking Windows for administrator rights to install the tunnel service"
+      Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$script`""
+    }
   } catch {
     Remove-Item $tokFile -Force -ErrorAction SilentlyContinue
     Fail "Administrator permission was declined; the tunnel service was not installed. Run the installer again to retry."
@@ -313,6 +335,7 @@ Save-State $state
 
 if (-not $NoHelper) {
   $helper = Join-Path $PSScriptRoot "ConnectionHelper.ps1"
-  Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$helper`" -Hostname $($state.hostname) -Port $port -Name `"$FriendlyName`""
+  $helperArgs = "-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$helper`" -Hostname $($state.hostname) -Port $port -Name `"$FriendlyName`""
+  Start-Process powershell.exe -ArgumentList $helperArgs
 }
 Log "Done."
