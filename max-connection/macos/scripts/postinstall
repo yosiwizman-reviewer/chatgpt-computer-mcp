@@ -1,0 +1,190 @@
+#!/bin/bash
+# Max Connection for macOS - pkg postinstall (runs as root).
+#
+# Mirrors the Windows installer:
+#   1. activation link from ~/Downloads/max-activation.txt, the clipboard, or a dialog
+#   2. Chat On Steroids (pinned, checksum-verified) in /Applications if missing/older than 2.1.52
+#   3. its settings: Local only, kept URLs/port, auto-connect, start at login, desktop control
+#   4. enrollment -> this Mac's own tunnel + hostname + token
+#   5. cloudflared (pinned, checksum-verified) as a LaunchDaemon
+#   6. public reachability check, then the connection helper and the privacy panes
+# Secrets are never logged. The machine secret lives in the user's login keychain.
+set -euo pipefail
+
+VERSION="0.1.0"
+ENROLL_URL="${MAX_ENROLL_URL:-https://enroll.akior.io}"
+COS_VERSION="2.1.53"
+COS_MIN="2.1.52"
+COS_ARM_URL="https://github.com/totec448-spec/chat-on-steroids/releases/download/v2.1.53/Chat-On-Steroids-macOS-arm64.dmg"
+COS_ARM_SHA="46b7f0b6ee2387721013c8a754aafef1a8b0da23dec484dc2a1633cf17084480"
+COS_X64_URL="https://github.com/totec448-spec/chat-on-steroids/releases/download/v2.1.53/Chat-On-Steroids-macOS-x64.dmg"
+COS_X64_SHA="f27d2ba06f2523c591d7a93e3058a2fff02929700711d53b54ce6fda367bf362"
+CFD_ARM_URL="https://github.com/cloudflare/cloudflared/releases/download/2026.11.0/cloudflared-darwin-arm64.tgz"
+CFD_ARM_SHA="97e24268d9704a570fab276293028f3580ae2c7d5d2678621a4809e90f776a5e"
+CFD_X64_URL="https://github.com/cloudflare/cloudflared/releases/download/2026.11.0/cloudflared-darwin-amd64.tgz"
+CFD_X64_SHA="be6be8d4aa0c3ff66917e265002fc9f702d42eae877edf495143f5b874c424af"
+
+USER_NAME="$(stat -f%Su /dev/console)"
+[ "$USER_NAME" = "root" ] || [ -z "$USER_NAME" ] && { echo "No signed-in user at the console"; exit 1; }
+USER_ID="$(id -u "$USER_NAME")"
+USER_HOME="$(dscl . -read "/Users/$USER_NAME" NFSHomeDirectory | awk '{print $2}')"
+STATE_DIR="$USER_HOME/Library/Application Support/MaxConnection"
+STATE="$STATE_DIR/state.json"
+LOG="$STATE_DIR/install.log"
+COS_APP="/Applications/Chat On Steroids.app"
+COS_DATA="$USER_HOME/Library/Application Support/chat-on-steroids"
+COS_CONFIG="$COS_DATA/config.json"
+COS_LOG="$COS_DATA/app.log"
+FRIENDLY="$(scutil --get ComputerName 2>/dev/null || hostname -s)"
+ARCH="$(uname -m)"   # arm64 | x86_64
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+as_user() { launchctl asuser "$USER_ID" sudo -u "$USER_NAME" "$@"; }
+mkdir -p "$STATE_DIR"; chown "$USER_NAME" "$STATE_DIR"
+log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)  $*" | tee -a "$LOG"; }
+fail() { log "FAILED: $*"; as_user osascript -e "display alert \"Max Connection\" message \"$*\"" >/dev/null 2>&1 || true; exit 1; }
+json_get() { /usr/bin/plutil -extract "$2" raw -o - "$1" 2>/dev/null || true; }   # plutil reads JSON too
+verify() { [ "$(shasum -a 256 "$1" | awk '{print $1}')" = "$2" ] || fail "Checksum mismatch for $(basename "$1")"; }
+b64url() { openssl rand -base64 "$1" | tr '+/' '-_' | tr -d '=\n'; }
+
+log "Max Connection $VERSION installer starting on $FRIENDLY ($ARCH), user $USER_NAME"
+
+# ---------------------------------------------------------------- identity
+KC_SERVICE="Max Connection machine secret"
+MACHINE_SECRET="$(as_user security find-generic-password -s "$KC_SERVICE" -a "$USER_NAME" -w 2>/dev/null || true)"
+if [ -z "$MACHINE_SECRET" ]; then
+  MACHINE_SECRET="$(b64url 32)"
+  as_user security add-generic-password -s "$KC_SERVICE" -a "$USER_NAME" -w "$MACHINE_SECRET" -U
+fi
+MACHINE_ID="$( [ -f "$STATE" ] && json_get "$STATE" machine_id )"
+[ -n "$MACHINE_ID" ] || MACHINE_ID="$(uuidgen | tr 'A-Z' 'a-z')"
+OLD_HOST="$( [ -f "$STATE" ] && json_get "$STATE" hostname )"
+OLD_PORT="$( [ -f "$STATE" ] && json_get "$STATE" port )"
+
+# ---------------------------------------------------------------- activation
+extract_code() { printf '%s' "$1" | grep -Eo '([#]|^)[A-Za-z0-9_-]{40,64}[[:space:]]*$' | tr -d '#[:space:]' | head -1; }
+CODE=""
+for f in "$USER_HOME/Downloads/max-activation.txt" "$USER_HOME/Desktop/max-activation.txt"; do
+  [ -z "$CODE" ] && [ -f "$f" ] && CODE="$(extract_code "$(cat "$f")")" && [ -n "$CODE" ] && rm -f "$f"
+done
+[ -z "$CODE" ] && CODE="$(extract_code "$(as_user pbpaste 2>/dev/null || true)")"
+if [ -z "$CODE" ]; then
+  TYPED="$(as_user osascript -e 'text returned of (display dialog "Paste the private Max Connection activation link for this Mac." default answer "" with title "Max Connection")' 2>/dev/null || true)"
+  CODE="$(extract_code "$TYPED")"
+fi
+[ -z "$CODE" ] && [ -z "$OLD_HOST" ] && fail "No activation link was provided."
+
+# ---------------------------------------------------------------- Chat On Steroids
+cos_version() { /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$COS_APP/Contents/Info.plist" 2>/dev/null || echo 0; }
+ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
+if [ -d "$COS_APP" ] && ver_ge "$(cos_version)" "$COS_MIN"; then
+  log "Chat On Steroids $(cos_version) already installed - reusing it"
+else
+  if [ "$ARCH" = "arm64" ]; then URL="$COS_ARM_URL"; SHA="$COS_ARM_SHA"; else URL="$COS_X64_URL"; SHA="$COS_X64_SHA"; fi
+  log "Downloading Chat On Steroids $COS_VERSION"
+  curl -fsSL "$URL" -o "$WORK/cos.dmg"; verify "$WORK/cos.dmg" "$SHA"
+  MNT="$WORK/mnt"; mkdir -p "$MNT"
+  hdiutil attach -nobrowse -readonly -mountpoint "$MNT" "$WORK/cos.dmg" >/dev/null
+  pkill -x "Chat On Steroids" || true
+  rm -rf "$COS_APP"; ditto "$MNT/Chat On Steroids.app" "$COS_APP"
+  hdiutil detach "$MNT" >/dev/null
+  log "Installed Chat On Steroids $(cos_version)"
+fi
+
+start_cos_get_port() {
+  local mark=0; [ -f "$COS_LOG" ] && mark=$(stat -f%z "$COS_LOG")
+  as_user open -g -a "$COS_APP"
+  for _ in $(seq 1 60); do
+    sleep 1
+    [ -f "$COS_LOG" ] || continue
+    local p; p="$(tail -c +"$((mark + 1))" "$COS_LOG" | grep -Eo 'server started on 127\.0\.0\.1:[0-9]+' | tail -1 | awk -F: '{print $NF}')"
+    [ -n "$p" ] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+stop_cos() { as_user osascript -e 'quit app "Chat On Steroids"' >/dev/null 2>&1 || true; sleep 2; pkill -x "Chat On Steroids" || true; sleep 1; }
+
+if [ ! -f "$COS_CONFIG" ]; then log "First start of Chat On Steroids"; start_cos_get_port >/dev/null || fail "Chat On Steroids did not start"; fi
+stop_cos
+cp "$COS_CONFIG" "$COS_CONFIG.max-connection-backup"
+SHARED="$USER_HOME/Max Connection"
+as_user mkdir -p "$SHARED"
+as_user osascript -l JavaScript - "$COS_CONFIG" "$FRIENDLY" "$SHARED" <<'JS'
+ObjC.import('Foundation');
+function run(argv){const [p,name,shared]=argv;
+const c=JSON.parse($.NSString.stringWithContentsOfFileEncodingError(p,4,null).js);
+for(const k of ["tunnel","mcp","ui"]) c[k]=c[k]||{};
+c.tunnel.kind="manual"; c.mcp.persistentUrls=true;
+Object.assign(c.ui,{autoConnect:true,startAtLogin:true,minimizeToTray:true,desktopUnattributed:true});
+c.connectorSuffix=name;
+if(!c.roots||!c.roots.length) c.roots=[{name:"max-connection",path:shared}];
+$(JSON.stringify(c,null,2)).writeToFileAtomicallyEncodingError(p,true,4,null);}
+JS
+log "Configured Chat On Steroids (Local only, kept URLs, auto-connect, start at login, desktop on)"
+
+PORT="$(start_cos_get_port)" || fail "Chat On Steroids did not start its local server"
+stop_cos
+PORT2="$(start_cos_get_port)" || fail "Chat On Steroids did not restart"
+[ "$PORT" = "$PORT2" ] || fail "Local port changed across restart ($PORT -> $PORT2)"
+log "Chat On Steroids local server on port $PORT (kept across a restart)"
+
+# ---------------------------------------------------------------- enrollment + tunnel
+HOST="$OLD_HOST"
+if [ -n "$CODE" ]; then
+  A="arm64"; [ "$ARCH" = "x86_64" ] && A="x64"
+  BODY="$(printf '{"code":"%s","machine_secret":"%s","machine_id":"%s","name":"%s","os":"macos","arch":"%s","port":%s}' \
+    "$CODE" "$MACHINE_SECRET" "$MACHINE_ID" "$(printf '%s' "$FRIENDLY" | tr -cd 'A-Za-z0-9 ._-')" "$A" "$PORT")"
+  RESP="$WORK/enroll.json"
+  CODE_HTTP="$(curl -sS -o "$RESP" -w '%{http_code}' -X POST -H 'content-type: application/json' --data "$BODY" "$ENROLL_URL/v1/enroll" || echo 000)"
+  BODY=""
+  case "$CODE_HTTP" in
+    200) ;;
+    400|403|429) fail "Activation refused ($CODE_HTTP). Ask for a new activation link." ;;
+    *) fail "Enrollment service error ($CODE_HTTP). Run the installer again to retry." ;;
+  esac
+  HOST="$(json_get "$RESP" hostname)"
+  TOKEN="$(json_get "$RESP" tunnel_token)"
+  rm -f "$RESP"
+  log "Enrolled as $HOST"
+
+  if [ "$ARCH" = "arm64" ]; then URL="$CFD_ARM_URL"; SHA="$CFD_ARM_SHA"; else URL="$CFD_X64_URL"; SHA="$CFD_X64_SHA"; fi
+  curl -fsSL "$URL" -o "$WORK/cfd.tgz"; verify "$WORK/cfd.tgz" "$SHA"
+  tar -xzf "$WORK/cfd.tgz" -C "$WORK"
+  install -m 0755 "$WORK/cloudflared" /usr/local/bin/cloudflared
+  PLIST=/Library/LaunchDaemons/com.cloudflare.cloudflared.plist
+  if [ -f "$PLIST" ] && [ ! -f /Library/Application\ Support/MaxConnection/owner.txt ]; then
+    fail "A cloudflared service not installed by Max Connection already exists; leaving it untouched."
+  fi
+  [ -f "$PLIST" ] && /usr/local/bin/cloudflared service uninstall >/dev/null 2>&1 || true
+  /usr/local/bin/cloudflared service install "$TOKEN" >/dev/null 2>&1 || fail "cloudflared service install failed"
+  TOKEN=""
+  mkdir -p "/Library/Application Support/MaxConnection"; echo "Max Connection" > "/Library/Application Support/MaxConnection/owner.txt"
+  log "Tunnel LaunchDaemon installed"
+elif [ "$OLD_PORT" != "$PORT" ]; then
+  curl -fsS -X POST -H 'content-type: application/json' \
+    --data "$(printf '{"machine_secret":"%s","port":%s}' "$MACHINE_SECRET" "$PORT")" "$ENROLL_URL/v1/update-port" >/dev/null \
+    || fail "Could not update the tunnel to the new local port"
+fi
+MACHINE_SECRET=""
+
+as_user /bin/sh -c "printf '{\"machine_id\":\"%s\",\"hostname\":\"%s\",\"port\":%s,\"friendly_name\":\"%s\",\"installed_version\":\"%s\"}\n' '$MACHINE_ID' '$HOST' '$PORT' '$FRIENDLY' '$VERSION' > '$STATE'"
+
+# ---------------------------------------------------------------- verify
+ok=""
+for _ in $(seq 1 24); do
+  s="$(curl -s -o /dev/null -w '%{http_code}' -X POST --data '{}' "https://$HOST/mcp/core/reachability-check" || true)"
+  [ "$s" = "404" ] && { ok=1; break; }
+  sleep 5
+done
+[ -n "$ok" ] || fail "https://$HOST did not reach this Mac within 2 minutes"
+log "Verified: https://$HOST reaches this Mac"
+
+# ---------------------------------------------------------------- permissions + helper
+as_user open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" || true
+as_user open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture" || true
+HELPER="/Library/Application Support/MaxConnection/connection-helper.sh"
+cp "$(dirname "$0")/connection-helper.sh" "$HELPER"; chmod 0755 "$HELPER"
+as_user /bin/bash -c "nohup '$HELPER' '$HOST' '$PORT' '$FRIENDLY' >/dev/null 2>&1 &"
+log "Done."
+exit 0
