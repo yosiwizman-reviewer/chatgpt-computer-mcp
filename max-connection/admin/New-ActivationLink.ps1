@@ -22,5 +22,17 @@ Push-Location (Join-Path $PSScriptRoot "..\worker")
 try { npx --yes wrangler@4 d1 execute max-connection --remote --command $sql | Out-Null; if ($LASTEXITCODE) { throw "wrangler failed ($LASTEXITCODE)" } }
 finally { Pop-Location }
 $link = "https://enroll.akior.io/activate#$code"
-Set-Clipboard -Value $link
-Write-Host "Activation link created (valid $Hours h, single use) and copied to the clipboard."
+# Clipboard first (retry: another app may hold it). Fallback: a file only this user can read.
+$copied = $false
+try {
+  Add-Type -AssemblyName System.Windows.Forms
+  for ($i = 0; $i -lt 20 -and -not $copied; $i++) {
+    try { [Windows.Forms.Clipboard]::SetText($link); $copied = $true } catch { Start-Sleep -Milliseconds 250 }
+  }
+} catch {}
+$outDir = Join-Path $env:LOCALAPPDATA "MaxConnection"
+New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+$out = Join-Path $outDir "last-activation-link.txt"
+Set-Content -Path $out -Value $link -NoNewline -Encoding ASCII
+icacls $out /inheritance:r /grant:r "$($env:USERNAME):(R,W,D)" | Out-Null
+Write-Host ("Activation link created (valid $Hours h, single use). " + $(if ($copied) { "Copied to the clipboard; " } else { "" }) + "also saved to $out (readable only by $env:USERNAME).")

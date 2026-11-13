@@ -16,7 +16,7 @@ RELEASES_URL = "https://github.com/yosiwizman-reviewer/chatgpt-computer-mcp/rele
 [[d1_databases]]
 binding = "DB"
 database_name = "max-connection"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "cb81101a-ebb6-4563-81a4-c8c93eda92a0"
 
 # Secret (never in this file): CF_API_TOKEN
 #   wrangler secret put CF_API_TOKEN
