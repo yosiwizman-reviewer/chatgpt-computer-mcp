@@ -1,0 +1,6 @@
+{
+  "name": "max-connection-enroll",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test test/enroll.test.mjs" }
+}

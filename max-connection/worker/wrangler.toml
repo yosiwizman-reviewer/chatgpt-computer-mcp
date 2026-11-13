@@ -1,0 +1,23 @@
+name = "max-connection-enroll"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = false
+
+routes = [{ pattern = "enroll.akior.io", custom_domain = true }]
+
+[vars]
+CF_ACCOUNT_ID = "f80e41d0797f3cc9ea38d12878ca863a"
+CF_ZONE_ID = "3a4a7d413402ac8afd5dfb5b384233d5"
+ZONE_NAME = "akior.io"
+# Labels the enrollment service must never hand out.
+RESERVED_NAMES = "mc-node-g,mc-enroll,mc-admin,mc-www"
+RELEASES_URL = "https://github.com/yosiwizman-reviewer/chatgpt-computer-mcp/releases"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "max-connection"
+database_id = "cb81101a-ebb6-4563-81a4-c8c93eda92a0"
+
+# Secret (never in this file): CF_API_TOKEN
+#   wrangler secret put CF_API_TOKEN
+#   Permissions: Account > Cloudflare Tunnel > Edit ; Zone (akior.io only) > DNS > Edit
